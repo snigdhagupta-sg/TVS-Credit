@@ -1,0 +1,138 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: funnel_mongodb
+    restart: no
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password123
+      MONGO_INITDB_DATABASE: funnel_analysis
+    volumes:
+      - mongodb_data:/data/db
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - funnel_network
+
+  milvus-etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - funnel_network
+
+  milvus-minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z-cpuv1
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - funnel_network
+
+  milvus-standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.6.0-gpu
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - milvus_data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - "milvus-etcd"
+      - "milvus-minio"
+    networks:
+      - funnel_network
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: funnel_redis
+    restart: no
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - funnel_network
+
+  app:
+    build: .
+    container_name: funnel_app
+    restart: no
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_URL=mongodb://admin:password123@mongodb:27017/funnel_analysis?authSource=admin
+      - MILVUS_HOST=milvus-standalone
+      - MILVUS_PORT=19530
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - mongodb
+      - milvus-standalone
+      - redis
+    volumes:
+      - ./data:/app/data
+    networks:
+      - funnel_network
+
+  dashboard:
+    build: ./dashboard
+    container_name: funnel_dashboard
+    restart: no
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=production
+    depends_on:
+      - app
+    networks:
+      - funnel_network
+
+volumes:
+  mongodb_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  redis_data:
+
+networks:
+  funnel_network:
+    driver: bridge
